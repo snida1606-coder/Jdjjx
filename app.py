@@ -5,7 +5,6 @@ import time
 import ssl
 import re
 import os
-import sys
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
 from websockets.exceptions import ConnectionClosed
@@ -26,7 +25,7 @@ TZ = timezone(timedelta(hours=5))
 WS_URL = "wss://ws2.quotex.io/socket.io/?EIO=3&transport=websocket"
 BASE_DOMAIN = "https://quotex.io"
 WS_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Origin": BASE_DOMAIN,
     "Referer": f"{BASE_DOMAIN}/pt/trade",
 }
@@ -45,40 +44,113 @@ def ts_str(ts):
     return datetime.fromtimestamp(ts, tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 # ------------------------------------------------------------
-# Login (with detailed logging)
+# Smart Login with aggressive cloudscraper settings
 # ------------------------------------------------------------
 def login():
-    print("🔐 Attempting login...")
-    for attempt in range(1, 21):
-        print(f"  Login attempt {attempt}/20...")
+    print("🔐 Attempting login with enhanced fingerprint...")
+
+    # 1. Create a cloudscraper with the most robust options
+    try:
+        # Try Node.js interpreter (if available on Render)
+        s = cloudscraper.create_scraper(
+            interpreter='nodejs',
+            delay=15,
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True,
+                'mobile': False
+            }
+        )
+        print("  Using Node.js interpreter")
+    except Exception:
+        # Fallback to js2py (pure Python, slower but works)
+        s = cloudscraper.create_scraper(
+            interpreter='js2py',
+            delay=15,
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
+        print("  Using js2py interpreter (fallback)")
+
+    # 2. Set extremely realistic headers
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "DNT": "1",
+    })
+
+    # 3. Retry with backoff
+    for attempt in range(1, 8):  # 7 attempts
+        wait = 5 * attempt  # 5,10,15,... seconds
+        print(f"  Attempt {attempt}/7 (wait {wait}s before next if fail)...")
+
         try:
-            s = cloudscraper.create_scraper(delay=10)
-            s.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
+            # ---- STRATEGY 1: API Login (fast) ----
+            print("  🚀 Trying API login...")
+            api_resp = s.post(
+                f"{BASE_DOMAIN}/api/v3/auth/sign-in",
+                json={"email": EMAIL, "password": PASSWORD},
+                timeout=30,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+            )
+            if api_resp.status_code == 200:
+                data = api_resp.json()
+                token = data.get("token")
+                if token:
+                    cookies = "; ".join([f"{k}={v}" for k, v in s.cookies.items()])
+                    print("  ✅ API Login SUCCESS")
+                    return token, cookies
+                else:
+                    print("  API responded but no token")
+            else:
+                print(f"  API status {api_resp.status_code}")
+
+            # ---- STRATEGY 2: HTML Form Login ----
+            print("  🌐 Trying HTML form login...")
+            # Visit trade page to get CSRF token
             r1 = s.get(f"{BASE_DOMAIN}/pt/trade", timeout=30)
             if r1.status_code != 200:
-                print(f"  ❌ Blocked (status {r1.status_code}) – trying API fallback...")
-                # Fallback: try the API endpoint
-                s.post(f"{BASE_DOMAIN}/api/v3/auth/sign-in", json={"email": EMAIL, "password": PASSWORD}, timeout=30)
-                r3 = s.get(f"{BASE_DOMAIN}/pt/trade", timeout=30)
-                for sc in re.findall(r'<script[^>]*>(.*?)</script>', r3.text, re.DOTALL):
-                    if "window.settings" in sc:
-                        start = sc.find("{")
-                        end = sc.rfind("}") + 1
-                        d = json.loads(sc[start:end])
-                        if d.get("token"):
-                            cookies = "; ".join([f"{k}={v}" for k, v in s.cookies.items()])
-                            print(f"  ✅ Login success via API")
-                            return d["token"], cookies
-                print(f"  ❌ Fallback also failed")
-                time.sleep(3)
+                print(f"  ❌ Page blocked (status {r1.status_code})")
+                time.sleep(wait)
                 continue
 
-            # Extract CSRF token
+            # Extract CSRF token from HTML
             m1 = re.search(r'name="_token"\s+value="([^"]+)"', r1.text)
             tok = m1.group(1) if m1 else None
             if not tok:
-                print("  ❌ No CSRF token found – trying API...")
-                time.sleep(3)
+                # Try to find it in JSON inside a script
+                script_re = re.search(r'window\.settings\s*=\s*({.*?});', r1.text, re.DOTALL)
+                if script_re:
+                    try:
+                        data = json.loads(script_re.group(1))
+                        if data.get('token'):
+                            cookies = "; ".join([f"{k}={v}" for k, v in s.cookies.items()])
+                            print("  ✅ Token found in window.settings (no form login needed)")
+                            return data['token'], cookies
+                    except:
+                        pass
+                print("  ❌ No CSRF token found")
+                time.sleep(wait)
                 continue
 
             time.sleep(2)
@@ -87,6 +159,8 @@ def login():
                 data={"_token": tok, "email": EMAIL, "password": PASSWORD, "remember": 1},
                 timeout=30
             )
+
+            # Search for token in response
             for sc in re.findall(r'<script[^>]*>(.*?)</script>', r4.text, re.DOTALL):
                 if "window.settings" in sc:
                     start = sc.find("{")
@@ -94,19 +168,21 @@ def login():
                     d = json.loads(sc[start:end])
                     if d.get("token"):
                         cookies = "; ".join([f"{k}={v}" for k, v in s.cookies.items()])
-                        print(f"  ✅ Login success")
+                        print("  ✅ HTML Login SUCCESS")
                         return d["token"], cookies
-            print(f"  ❌ Login failed (no token in response)")
-            time.sleep(3)
+
+            print("  ❌ Login failed (no token in response)")
+            time.sleep(wait)
+
         except Exception as e:
             print(f"  ❌ Exception: {e}")
-            time.sleep(3)
+            time.sleep(wait)
 
     print("❌ All login attempts failed.")
     return None, None
 
 # ------------------------------------------------------------
-# WebSocket connection
+# WebSocket connection (unchanged)
 # ------------------------------------------------------------
 async def connect_ws(ssid, cookies=""):
     import websockets
@@ -133,7 +209,7 @@ async def bg_keepalive(ws):
             break
 
 # ------------------------------------------------------------
-# Initialization (with error handling)
+# Initialization (unchanged)
 # ------------------------------------------------------------
 async def init():
     global _ws, _ssid, _cookies, _pairs, _bg_task
@@ -148,7 +224,6 @@ async def init():
         _ws = await connect_ws(_ssid, _cookies)
         _bg_task = asyncio.create_task(bg_keepalive(_ws))
 
-        # Request instruments
         print("📡 Requesting instruments...")
         await _ws.send('42["instruments/update",{"asset":"EURUSD_otc","period":60}]')
         await _ws.send('42["indicator/list"]')
@@ -156,7 +231,7 @@ async def init():
         pending = ""
         instruments = None
         T0 = time.time()
-        while time.time() - T0 < 15:  # increased timeout to 15s
+        while time.time() - T0 < 15:
             try:
                 raw = await asyncio.wait_for(_ws.recv(), timeout=2)
             except asyncio.TimeoutError:
@@ -208,15 +283,13 @@ async def init():
         traceback.print_exc()
 
 # ------------------------------------------------------------
-# Fetch candles (with resilience)
+# fetch_candles (unchanged, keep from previous version)
 # ------------------------------------------------------------
 async def fetch_candles(pair_name, tf_sec=60):
     global _ws, _pairs
     if _ws is None:
-        print("❌ WebSocket not available.")
         return {"error": "WebSocket not connected"}
 
-    # Find pair ID
     sid = None
     display = ""
     payout = 0
@@ -231,14 +304,12 @@ async def fetch_candles(pair_name, tf_sec=60):
     if sid is None:
         return None
 
-    # Keep WS alive
     for attempt in range(1, 21):
         try:
             await _ws.send("2")
             break
         except ConnectionClosed:
             if attempt >= 20:
-                print("❌ Reconnect failed")
                 return None
             print(f"🔄 Reconnecting WS {attempt}/20...")
             _bg_task.cancel()
@@ -249,7 +320,6 @@ async def fetch_candles(pair_name, tf_sec=60):
                 print(f"  Reconnect error: {e}")
                 return None
 
-    # Send requests
     await _ws.send(f'42["instruments/update",{json.dumps({"asset":pair_name,"period":tf_sec})}]')
     await _ws.send('42["indicator/list"]')
     await _ws.send(f'42["chart_notification/get",{json.dumps({"asset":pair_name,"version":"1.0.0"})}]')
@@ -294,7 +364,6 @@ async def fetch_candles(pair_name, tf_sec=60):
                 bdata = raw[1:] if raw[0:1] == b'\x04' else raw
                 dj = json.loads(bdata.decode(errors="replace"))
                 if isinstance(dj, list) and len(dj) > 0 and isinstance(dj[0], list) and len(dj[0]) >= 10:
-                    # Update pairs list if needed
                     fresh = []
                     for item in dj:
                         if isinstance(item, list) and len(item) >= 2:
@@ -378,7 +447,7 @@ async def fetch_candles(pair_name, tf_sec=60):
     }
 
 # ------------------------------------------------------------
-# Flask Routes
+# Flask Routes (unchanged)
 # ------------------------------------------------------------
 @app.route('/')
 def home():
@@ -406,7 +475,7 @@ def get_data(pair):
 @app.route('/<pair>/<int:tf>')
 def get_data_tf(pair, tf):
     if _ws is None:
-        return jsonify({"error": "WebSocket not connected – initialization failed"}), 503
+        return jsonify({"error": "WebSocket not connected"}), 503
 
     future = asyncio.run_coroutine_threadsafe(fetch_candles(pair, tf), loop)
     try:
@@ -470,7 +539,6 @@ if __name__ == "__main__":
     if _pairs:
         print(f"✅ Init completed – {len(_pairs)} pairs loaded. Starting server on port {port}.")
     else:
-        print("⚠️  Init incomplete or failed – but server will start anyway. Some endpoints may return errors.")
+        print("⚠️  Init incomplete – server will start, but endpoints may return errors.")
 
-    # Always start the server
     app.run(host="0.0.0.0", port=port, debug=False)
