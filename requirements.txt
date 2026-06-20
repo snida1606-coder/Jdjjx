@@ -1,0 +1,4 @@
+flask
+websockets
+httpx
+certifi
