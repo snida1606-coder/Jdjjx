@@ -1,9 +1,6 @@
 import json, os, httpx
 from flask import Flask, jsonify
-try:
-    from github_config import GITHUB_USER, GITHUB_REPO
-except:
-    GITHUB_USER = GITHUB_REPO = ""
+from github_config import GITHUB_USER, GITHUB_REPO
 
 app = Flask(__name__)
 app.json.sort_keys = False
